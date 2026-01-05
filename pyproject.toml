@@ -1,0 +1,10 @@
+[project]
+name = "freethreading-asyncio"
+version = "0.1.0"
+description = "Benchmarks for Python 3.14 free-threading with asyncio"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+benchmark = "benchmark:main"
