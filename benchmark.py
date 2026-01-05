@@ -6,10 +6,11 @@ can achieve true parallelism with the GIL disabled.
 """
 
 import asyncio
+import multiprocessing
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 
 def cpu_intensive_work(iterations: int = 10_000_000) -> float:
@@ -36,47 +37,49 @@ def run_asyncio_in_thread(iterations: int, results: list, index: int) -> None:
         loop.close()
 
 
+NUM_THREADS = 4
+
+
 def benchmark_single_thread(iterations: int) -> tuple[float, float]:
     """Run CPU work sequentially in a single thread."""
     start = time.perf_counter()
-    result1 = cpu_intensive_work(iterations)
-    result2 = cpu_intensive_work(iterations)
+    results = [cpu_intensive_work(iterations) for _ in range(NUM_THREADS)]
     elapsed = time.perf_counter() - start
-    return elapsed, result1 + result2
+    return elapsed, sum(results)
 
 
-def benchmark_two_threads(iterations: int) -> tuple[float, float]:
-    """Run CPU work in parallel using two threads with asyncio."""
-    results = [0.0, 0.0]
-
-    thread1 = threading.Thread(target=run_asyncio_in_thread, args=(iterations, results, 0))
-    thread2 = threading.Thread(target=run_asyncio_in_thread, args=(iterations, results, 1))
+def benchmark_threads_with_asyncio(iterations: int) -> tuple[float, float]:
+    """Run CPU work in parallel using threads with asyncio."""
+    results = [0.0] * NUM_THREADS
+    threads = [
+        threading.Thread(target=run_asyncio_in_thread, args=(iterations, results, i))
+        for i in range(NUM_THREADS)
+    ]
 
     start = time.perf_counter()
-    thread1.start()
-    thread2.start()
-    thread1.join()
-    thread2.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     elapsed = time.perf_counter() - start
 
     return elapsed, sum(results)
 
 
-def benchmark_two_threads_no_asyncio(iterations: int) -> tuple[float, float]:
-    """Run CPU work in parallel using two threads without asyncio."""
-    results = [0.0, 0.0]
+def benchmark_threads_no_asyncio(iterations: int) -> tuple[float, float]:
+    """Run CPU work in parallel using threads without asyncio."""
+    results = [0.0] * NUM_THREADS
 
     def worker(idx: int) -> None:
         results[idx] = cpu_intensive_work(iterations)
 
-    thread1 = threading.Thread(target=worker, args=(0,))
-    thread2 = threading.Thread(target=worker, args=(1,))
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(NUM_THREADS)]
 
     start = time.perf_counter()
-    thread1.start()
-    thread2.start()
-    thread1.join()
-    thread2.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     elapsed = time.perf_counter() - start
 
     return elapsed, sum(results)
@@ -85,21 +88,68 @@ def benchmark_two_threads_no_asyncio(iterations: int) -> tuple[float, float]:
 def benchmark_thread_pool(iterations: int) -> tuple[float, float]:
     """Run CPU work using ThreadPoolExecutor."""
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future1 = executor.submit(cpu_intensive_work, iterations)
-        future2 = executor.submit(cpu_intensive_work, iterations)
-        result = future1.result() + future2.result()
+    with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+        futures = [executor.submit(cpu_intensive_work, iterations) for _ in range(NUM_THREADS)]
+        result = sum(f.result() for f in futures)
     elapsed = time.perf_counter() - start
     return elapsed, result
 
 
-async def benchmark_asyncio_gather_threads(iterations: int) -> tuple[float, float]:
+async def benchmark_asyncio_to_thread(iterations: int) -> tuple[float, float]:
     """Use asyncio.to_thread to run CPU work in parallel."""
     start = time.perf_counter()
     results = await asyncio.gather(
-        asyncio.to_thread(cpu_intensive_work, iterations),
-        asyncio.to_thread(cpu_intensive_work, iterations),
+        *[asyncio.to_thread(cpu_intensive_work, iterations) for _ in range(NUM_THREADS)]
     )
+    elapsed = time.perf_counter() - start
+    return elapsed, sum(results)
+
+
+def run_asyncio_in_process(iterations: int) -> float:
+    """Run an asyncio event loop in a process with CPU-bound work."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(async_cpu_work(iterations))
+    finally:
+        loop.close()
+
+
+def benchmark_processes_with_asyncio(iterations: int) -> tuple[float, float]:
+    """Run CPU work in parallel using processes with asyncio."""
+    start = time.perf_counter()
+    with multiprocessing.Pool(NUM_THREADS) as pool:
+        results = pool.map(run_asyncio_in_process, [iterations] * NUM_THREADS)
+    elapsed = time.perf_counter() - start
+    return elapsed, sum(results)
+
+
+def benchmark_processes_no_asyncio(iterations: int) -> tuple[float, float]:
+    """Run CPU work in parallel using processes without asyncio."""
+    start = time.perf_counter()
+    with multiprocessing.Pool(NUM_THREADS) as pool:
+        results = pool.map(cpu_intensive_work, [iterations] * NUM_THREADS)
+    elapsed = time.perf_counter() - start
+    return elapsed, sum(results)
+
+
+def benchmark_process_pool(iterations: int) -> tuple[float, float]:
+    """Run CPU work using ProcessPoolExecutor."""
+    start = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=NUM_THREADS) as executor:
+        futures = [executor.submit(cpu_intensive_work, iterations) for _ in range(NUM_THREADS)]
+        result = sum(f.result() for f in futures)
+    elapsed = time.perf_counter() - start
+    return elapsed, result
+
+
+async def benchmark_asyncio_run_in_executor_process(iterations: int) -> tuple[float, float]:
+    """Use asyncio with ProcessPoolExecutor."""
+    start = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    with ProcessPoolExecutor(max_workers=NUM_THREADS) as executor:
+        futures = [loop.run_in_executor(executor, cpu_intensive_work, iterations) for _ in range(NUM_THREADS)]
+        results = await asyncio.gather(*futures)
     elapsed = time.perf_counter() - start
     return elapsed, sum(results)
 
@@ -108,7 +158,7 @@ def print_result(name: str, elapsed: float, baseline: float | None = None) -> No
     """Print benchmark result with optional speedup calculation."""
     if baseline is not None:
         speedup = baseline / elapsed
-        efficiency = (speedup / 2) * 100  # 2 threads, so max speedup is 2x
+        efficiency = (speedup / NUM_THREADS) * 100
         print(f"  {name}: {elapsed:.3f}s (speedup: {speedup:.2f}x, efficiency: {efficiency:.1f}%)")
     else:
         print(f"  {name}: {elapsed:.3f}s (baseline)")
@@ -139,7 +189,7 @@ def main() -> None:
         print()
 
     iterations = 5_000_000
-    print(f"Running benchmarks with {iterations:,} iterations per task...")
+    print(f"Running benchmarks with {iterations:,} iterations per task, {NUM_THREADS} workers...")
     print()
 
     # Warmup
@@ -153,39 +203,75 @@ def main() -> None:
 
     # Single thread baseline
     single_time, _ = benchmark_single_thread(iterations)
-    print_result("Single thread (2 sequential tasks)", single_time)
+    print_result(f"Single thread ({NUM_THREADS} sequential tasks)", single_time)
 
-    # Two threads without asyncio
-    two_threads_time, _ = benchmark_two_threads_no_asyncio(iterations)
-    print_result("Two threads (no asyncio)", two_threads_time, single_time)
+    print()
+    print("  Threading:")
 
-    # Two threads with asyncio
-    two_asyncio_time, _ = benchmark_two_threads(iterations)
-    print_result("Two threads (with asyncio event loops)", two_asyncio_time, single_time)
+    # Threads without asyncio
+    threads_time, _ = benchmark_threads_no_asyncio(iterations)
+    print_result(f"{NUM_THREADS} threads (no asyncio)", threads_time, single_time)
+
+    # Threads with asyncio
+    threads_asyncio_time, _ = benchmark_threads_with_asyncio(iterations)
+    print_result(f"{NUM_THREADS} threads (with asyncio event loops)", threads_asyncio_time, single_time)
 
     # ThreadPoolExecutor
-    pool_time, _ = benchmark_thread_pool(iterations)
-    print_result("ThreadPoolExecutor (2 workers)", pool_time, single_time)
+    thread_pool_time, _ = benchmark_thread_pool(iterations)
+    print_result(f"ThreadPoolExecutor ({NUM_THREADS} workers)", thread_pool_time, single_time)
 
     # asyncio.to_thread
-    gather_time, _ = asyncio.run(benchmark_asyncio_gather_threads(iterations))
-    print_result("asyncio.to_thread + gather", gather_time, single_time)
+    to_thread_time, _ = asyncio.run(benchmark_asyncio_to_thread(iterations))
+    print_result("asyncio.to_thread + gather", to_thread_time, single_time)
+
+    print()
+    print("  Multiprocessing:")
+
+    # Processes without asyncio
+    procs_time, _ = benchmark_processes_no_asyncio(iterations)
+    print_result(f"{NUM_THREADS} processes (no asyncio)", procs_time, single_time)
+
+    # Processes with asyncio
+    procs_asyncio_time, _ = benchmark_processes_with_asyncio(iterations)
+    print_result(f"{NUM_THREADS} processes (with asyncio event loops)", procs_asyncio_time, single_time)
+
+    # ProcessPoolExecutor
+    proc_pool_time, _ = benchmark_process_pool(iterations)
+    print_result(f"ProcessPoolExecutor ({NUM_THREADS} workers)", proc_pool_time, single_time)
+
+    # asyncio + ProcessPoolExecutor
+    asyncio_proc_time, _ = asyncio.run(benchmark_asyncio_run_in_executor_process(iterations))
+    print_result("asyncio + ProcessPoolExecutor", asyncio_proc_time, single_time)
 
     print("-" * 70)
     print()
 
     # Analysis
     print("Analysis:")
+
+    best_thread_time = min(threads_time, threads_asyncio_time, thread_pool_time, to_thread_time)
+    best_proc_time = min(procs_time, procs_asyncio_time, proc_pool_time, asyncio_proc_time)
+    best_thread_speedup = single_time / best_thread_time
+    best_proc_speedup = single_time / best_proc_time
+
     if gil_enabled is False:
-        if two_threads_time < single_time * 0.7:
-            print("  ✓ True parallelism achieved! Threads are running on multiple CPUs.")
-            print(f"  ✓ Best speedup: {single_time / min(two_threads_time, two_asyncio_time, pool_time, gather_time):.2f}x")
+        if best_thread_speedup > NUM_THREADS * 0.5:
+            print("  ✓ True parallelism achieved with threads! GIL-free threading works.")
+            print(f"  ✓ Best thread speedup: {best_thread_speedup:.2f}x (theoretical max: {NUM_THREADS}x)")
         else:
-            print("  ⚠ Limited parallelism detected despite GIL being disabled.")
-            print("    This could be due to other bottlenecks.")
+            print("  ⚠ Limited thread parallelism despite GIL being disabled.")
     else:
         print("  ⚠ GIL is enabled, so threads cannot run Python code in parallel.")
-        print("    Expected speedup is ~1.0x for CPU-bound work.")
+        print("    Expected thread speedup is ~1.0x for CPU-bound work.")
+
+    print(f"  ✓ Best process speedup: {best_proc_speedup:.2f}x (theoretical max: {NUM_THREADS}x)")
+
+    if gil_enabled is False and best_thread_speedup > 0:
+        ratio = best_thread_speedup / best_proc_speedup
+        if ratio > 0.9:
+            print(f"  ✓ Threading is comparable to multiprocessing ({ratio:.0%} efficiency)")
+        else:
+            print(f"  → Threading achieves {ratio:.0%} of multiprocessing performance")
 
     print()
     print("=" * 70)
