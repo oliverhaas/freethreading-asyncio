@@ -4,7 +4,6 @@ Minimal Django benchmark for Python 3.14 free-threading.
 Uses Granian server with WSGI interface and blocking threads.
 """
 
-import asyncio
 import os
 import sys
 import threading
@@ -92,14 +91,19 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-async def run_concurrent_requests(url: str, num_requests: int) -> list[dict]:
-    """Make concurrent HTTP requests."""
+def run_concurrent_requests_sync(url: str, num_requests: int) -> list[dict]:
+    """Make concurrent HTTP requests using threads."""
     import httpx
+    from concurrent.futures import ThreadPoolExecutor
 
-    async with httpx.AsyncClient() as client:
-        tasks = [client.get(url, timeout=120.0) for _ in range(num_requests)]
-        responses = await asyncio.gather(*tasks)
-        return [r.json() for r in responses]
+    def make_request():
+        with httpx.Client() as client:
+            response = client.get(url, timeout=120.0)
+            return response.json()
+
+    with ThreadPoolExecutor(max_workers=num_requests) as executor:
+        futures = [executor.submit(make_request) for _ in range(num_requests)]
+        return [f.result() for f in futures]
 
 
 def run_benchmark(port: int):
@@ -134,7 +138,7 @@ def run_benchmark(port: int):
     # Concurrent requests
     print(f"Making {NUM_WORKERS} concurrent requests...")
     start = time.perf_counter()
-    concurrent_results = asyncio.run(run_concurrent_requests(f"{base_url}/cpu/", NUM_WORKERS))
+    concurrent_results = run_concurrent_requests_sync(f"{base_url}/cpu/", NUM_WORKERS)
     concurrent_time = time.perf_counter() - start
     print(f"  Concurrent: {concurrent_time:.3f}s")
 
@@ -145,7 +149,7 @@ def run_benchmark(port: int):
     print(f"Speedup: {speedup:.2f}x (efficiency: {efficiency:.1f}%)")
 
     threads_used = set(r["thread"] for r in concurrent_results)
-    print(f"Threads used: {len(threads_used)}")
+    print(f"Threads used: {len(threads_used)} - {sorted(threads_used)}")
 
     # Analysis
     gil_enabled = sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else "N/A"
@@ -182,17 +186,19 @@ def main():
     port = find_free_port()
 
     # Start granian server with WSGI interface
+    # With free-threading, workers become threads in a single process
+    # Use more workers than requests to ensure all requests can be handled in parallel
     cmd = [
         sys.executable, "-m", "granian",
         "--interface", "wsgi",
         "--host", "127.0.0.1",
         "--port", str(port),
-        "--workers", "1",
-        "--blocking-threads", str(NUM_WORKERS),
+        "--workers", str(NUM_WORKERS * 2),  # Extra workers to handle concurrent requests
+        "--backpressure", str(NUM_WORKERS * 2),
         "django_benchmark:application",
     ]
 
-    print(f"Starting Granian with {NUM_WORKERS} blocking threads...")
+    print(f"Starting Granian with {NUM_WORKERS * 2} workers...")
     server_proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
