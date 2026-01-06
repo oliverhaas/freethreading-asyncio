@@ -1,9 +1,10 @@
 """
-Minimal Django benchmark for Python 3.14 free-threading.
+Minimal Django ASGI benchmark for Python 3.14 free-threading.
 
-Uses Granian server with WSGI interface and blocking threads.
+Uses Granian server with ASGI interface.
 """
 
+import asyncio
 import os
 import sys
 import threading
@@ -41,35 +42,41 @@ if not settings.configured:
 
 django.setup()
 
+from concurrent.futures import ThreadPoolExecutor
 from django.http import JsonResponse
 from django.urls import path
-from django.core.wsgi import get_wsgi_application
+from django.core.asgi import get_asgi_application
 
 NUM_WORKERS = 4
 ITERATIONS = 5_000_000  # CPU work per request
 
+# Create a thread pool executor for CPU-bound work
+cpu_executor = ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="cpu-worker")
 
-def cpu_intensive_work(iterations: int) -> float:
-    """Pure Python CPU-bound work."""
+
+def cpu_intensive_work(iterations: int) -> tuple[float, str]:
+    """Pure Python CPU-bound work. Returns result and thread name."""
+    thread_name = threading.current_thread().name
     total = 0.0
     for i in range(iterations):
         total += i * i / (i + 1)
-    return total
+    return total, thread_name
 
 
-def cpu_bound_view(request):
-    """A sync view that does CPU-intensive work."""
+async def cpu_bound_view(request):
+    """An async view that does CPU-intensive work in a thread pool."""
     start = time.perf_counter()
-    result = cpu_intensive_work(ITERATIONS)
+    loop = asyncio.get_event_loop()
+    result, thread_name = await loop.run_in_executor(cpu_executor, cpu_intensive_work, ITERATIONS)
     elapsed = time.perf_counter() - start
     return JsonResponse({
         "result": result,
         "elapsed": elapsed,
-        "thread": threading.current_thread().name,
+        "thread": thread_name,
     })
 
 
-def health_view(request):
+async def health_view(request):
     """Simple health check."""
     return JsonResponse({"status": "ok"})
 
@@ -80,8 +87,8 @@ urlpatterns = [
     path("health/", health_view),
 ]
 
-# WSGI application
-application = get_wsgi_application()
+# ASGI application
+application = get_asgi_application()
 
 
 def find_free_port() -> int:
@@ -185,20 +192,19 @@ def main():
 
     port = find_free_port()
 
-    # Start granian server with WSGI interface
+    # Start granian server with ASGI interface
     # With free-threading, workers become threads in a single process
-    # Use more workers than requests to ensure all requests can be handled in parallel
     cmd = [
         sys.executable, "-m", "granian",
-        "--interface", "wsgi",
+        "--interface", "asgi",
         "--host", "127.0.0.1",
         "--port", str(port),
-        "--workers", str(NUM_WORKERS * 2),  # Extra workers to handle concurrent requests
+        "--workers", str(NUM_WORKERS * 2),
         "--backpressure", str(NUM_WORKERS * 2),
         "django_benchmark:application",
     ]
 
-    print(f"Starting Granian with {NUM_WORKERS * 2} workers...")
+    print(f"Starting Granian ASGI with {NUM_WORKERS * 2} workers...")
     server_proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
